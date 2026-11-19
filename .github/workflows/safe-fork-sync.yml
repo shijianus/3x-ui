@@ -1,0 +1,96 @@
+name: Safe upstream backup (3x-ui)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: 3x-ui-upstream-backup
+  cancel-in-progress: false
+
+jobs:
+  code:
+    name: Keep code, never propagate deletions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Safely merge upstream/main
+        shell: bash
+        env:
+          UPSTREAM: MHSanaei/3x-ui
+          BRANCH: main
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${UPSTREAM}.git"
+          else
+            git remote add upstream "https://github.com/${UPSTREAM}.git"
+          fi
+          if ! git ls-remote --exit-code --heads upstream "$BRANCH" >/dev/null 2>&1; then
+            echo 'Upstream unavailable: leave the backup untouched.'
+            exit 0
+          fi
+          git fetch --no-tags upstream "refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH"
+          if git merge-base --is-ancestor "upstream/$BRANCH" HEAD; then
+            echo 'Code already includes upstream.'
+            exit 0
+          fi
+          # Stop on conflicts: never force-push or guess which edit to keep.
+          git merge --no-ff --no-commit "upstream/$BRANCH"
+          # A rename includes a deletion; keep the original file as well.
+          while IFS= read -r -d '' path; do
+            git restore --source=HEAD --staged --worktree -- "$path"
+          done < <(git diff --cached --no-renames --diff-filter=D --name-only -z HEAD --)
+          # Upstream workflows must not add/replace/delete this fork's Actions.
+          while IFS= read -r -d '' path; do
+            if git cat-file -e "HEAD:$path" 2>/dev/null; then
+              git restore --source=HEAD --staged --worktree -- "$path"
+            else
+              git rm -f --ignore-unmatch -- "$path"
+            fi
+          done < <(git diff --cached --no-renames --name-only -z HEAD -- .github/workflows/)
+          git commit -m "backup: merge ${UPSTREAM} ${BRANCH} (preserve files)"
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+  releases:
+    name: Add missing tags and release assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Incrementally back up official releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: MHSanaei/3x-ui
+          BACKUP: ${{ github.repository }}
+          MAX_RELEASES: '1'
+        run: |
+          set -Eeuo pipefail
+          export GH_PROMPT_DISABLED=1
+          if ! gh api "repos/$UPSTREAM" --jq '.full_name' >/dev/null 2>&1; then
+            echo 'Upstream unavailable: do not modify local releases.'
+            exit 0
+          fi
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          workspace=$(mktemp -d)
+          trap 'rm -rf "$workspace"' EXIT
+          gh api --paginate "repos/$UPSTREAM/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .tag_name != "dev-latest") | .tag_name' \
+            > "$workspace/tags.txt"
+          processed=0
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            gh api "repos/$UPSTREAM/releases/tags/$tag" > "$workspace/source.json"
+            if gh api "repos/$BACKUP/releases/tags/$tag" > "$workspace/dest.json" 2> "$workspace/error.txt"; then
+              exists=true
+            elif grep -q 'HTTP 404' "$workspace/error.txt"; then
