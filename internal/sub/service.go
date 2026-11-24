@@ -590,14 +590,15 @@ func (s *SubService) getSubs(subId string) ([]string, []string, int64, xray.Clie
 		// Host overrides apply AFTER fallback projection so a host's
 		// address/TLS wins over the projected master stream.
 		var hostEps []map[string]any
+		var hostsClosed bool
 		if !s.hostsFirst {
-			hostEps = s.hostEndpoints(inbound, "raw")
+			hostEps, hostsClosed = s.hostEndpoints(inbound, "raw")
 		}
 		for _, client := range clients {
 			if client.Enable {
 				hasEnabledClient = true
 			}
-			if s.rendered.spent() {
+			if hostsClosed || s.rendered.spent() {
 				seenEmails[client.Email] = struct{}{}
 				continue
 			}
@@ -698,7 +699,10 @@ func (s *SubService) inboundLinks(inbound *model.Inbound) []string {
 	}
 	s.primeLinkClients(inbound.Id, clients, true)
 	s.projectThroughFallbackMaster(inbound)
-	hostEps := s.hostEndpoints(inbound, "raw")
+	hostEps, hostsClosed := s.hostEndpoints(inbound, "raw")
+	if hostsClosed {
+		return nil
+	}
 	var out []string
 	seen := make(map[string]struct{}, len(clients))
 	for _, client := range clients {
@@ -1133,11 +1137,16 @@ func (s *SubService) genWireguardLink(inbound *model.Inbound, email string) stri
 	if ka := client.KeepAliveSeconds(); ka > 0 {
 		params["keepalive"] = strconv.Itoa(ka)
 	}
+	if finalmask, ok := unmarshalStreamSettings(inbound.StreamSettings)["finalmask"].(map[string]any); ok {
+		applyFinalMaskParams(finalmask, params)
+	}
 	endpoints := s.advertisedEndpoints(inbound)
 	links := make([]string, 0, len(endpoints))
 	for _, e := range endpoints {
 		link := fmt.Sprintf("wireguard://%s@%s", encodeUserinfo(client.PrivateKey), joinHostPort(e.Address, e.Port))
-		links = append(links, buildLinkWithParams(link, params, s.endpointRemark(inbound, email, e.ep, "")))
+		epParams := cloneStringMap(params)
+		applyEndpointFinalMask(e, epParams)
+		links = append(links, buildLinkWithParams(link, epParams, s.endpointRemark(inbound, email, e.ep, "")))
 	}
 	return strings.Join(links, "\n")
 }

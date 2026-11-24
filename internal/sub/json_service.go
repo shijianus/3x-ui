@@ -152,12 +152,13 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 		}
 		subReq.projectThroughFallbackMaster(inbound)
 		var baseEps []map[string]any
+		var hostsClosed bool
 		baseStream := inbound.StreamSettings
 		// getConfig rewrites inbound.Listen/Port per endpoint while rendering a client, so bound
 		// endpoints resolve against this pre-loop snapshot.
 		baseInbound := *inbound
 		if !subReq.hostsFirst {
-			if baseEps = subReq.hostEndpoints(inbound, "json"); len(baseEps) > 0 {
+			if baseEps, hostsClosed = subReq.hostEndpoints(inbound, "json"); len(baseEps) > 0 {
 				injectExternalProxy(inbound, baseEps)
 			}
 		}
@@ -168,6 +169,10 @@ func (s *SubJsonService) GetJson(subId string, host string, alwaysReturnArray bo
 				hasEnabledClient = true
 			}
 			seenEmails[client.Email] = struct{}{}
+			if hostsClosed {
+				hasBoundClosed = true
+				continue
+			}
 			if subReq.hostsFirst {
 				variants, closed := subReq.clientHostVariants(&baseInbound, client, "json")
 				hasBoundClosed = hasBoundClosed || closed
@@ -740,7 +745,7 @@ func (s *SubJsonService) getConfig(subReq *SubService, inbound *model.Inbound, c
 		case "masque":
 			newOutbounds = append(newOutbounds, s.genMasque(inbound, newStream, client))
 		case "wireguard":
-			wgOutbound := s.genWireguard(subReq, inbound, client)
+			wgOutbound := s.genWireguard(subReq, inbound, newStream, client)
 			if wgOutbound == nil {
 				continue
 			}
@@ -1120,7 +1125,7 @@ func (s *SubJsonService) genMasque(inbound *model.Inbound, newStream map[string]
 // mirroring genWireguardLink: the peer public key is derived from the inbound
 // secretKey, the client owns the private key / tunnel address / pre-shared key,
 // and the peer routes the full tunnel. Returns nil when the client has no key.
-func (s *SubJsonService) genWireguard(subReq *SubService, inbound *model.Inbound, client model.Client) json_util.RawMessage {
+func (s *SubJsonService) genWireguard(subReq *SubService, inbound *model.Inbound, stream map[string]any, client model.Client) json_util.RawMessage {
 	if client.PrivateKey == "" {
 		return nil
 	}
@@ -1159,6 +1164,9 @@ func (s *SubJsonService) genWireguard(subReq *SubService, inbound *model.Inbound
 		"protocol": string(inbound.Protocol),
 		"tag":      "proxy",
 		"settings": settings,
+	}
+	if finalmask, ok := stream["finalmask"].(map[string]any); ok && hasFinalMaskContent(finalmask) {
+		outbound["streamSettings"] = map[string]any{"finalmask": finalmask}
 	}
 	result, _ := json.MarshalIndent(outbound, "", "  ")
 	return result
